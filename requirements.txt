@@ -1,0 +1,7 @@
+flask==3.0.3
+gunicorn==21.2.0
+opencv-python-headless==4.10.0.84
+numpy==2.1.2
+# Descomenta si el front (Vercel) llamará a tu backend (Render) desde otro dominio:
+# flask-cors==4.0.0
+
