@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Lector QR (Cámara o Imagen)</title>
+  <!-- jsQR para decodificar en el navegador -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr/dist/jsQR.js"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans";
+      margin: 0; padding: 24px;
+      display: grid; place-items: start center; gap: 16px;
+      background: rgba(0,0,0,0.02);
+    }
+    .card {
+      width: min(960px, 92vw);
+      background: var(--card-bg, #fff);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      border: 1px solid rgba(0,0,0,0.06);
+    }
+    h1 { margin: 0 0 8px; font-size: 1.5rem; }
+    p { margin: 0 0 12px; opacity: .85; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    button, .file, select {
+      border: 0; border-radius: 10px; padding: 10px 14px;
+      background: #2b6cb0; color: #fff; cursor: pointer; font-weight: 600;
+    }
+    select { background: #1f2937; color: #fff; }
+    button.secondary { background: #6b7280; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    #video {
+      width: 100%; max-height: 60vh; border-radius: 12px; background: #000;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 999px;
+      background: #eef2ff; color: #1e3a8a; font-size: .9rem; font-weight: 600;
+    }
+    .result {
+      padding: 10px; background: #f1f5f9; border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono";
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .footer { font-size: .9rem; opacity: .7; margin-top: 12px; }
+    input[type="file"].file { background:#0f766e; }
+    form#uploadForm button[type="submit"] { background:#0ea5e9; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>📷 Lector de Códigos QR</h1>
+    <p>Escanea con la cámara <strong>o</strong> sube una imagen con un QR. Si el contenido es un enlace, te redirigimos automáticamente.</p>
+
+    <!-- Controles -->
+    <div class="row">
+      <button id="startBtn">Iniciar cámara</button>
+      <button id="stopBtn" class="secondary" disabled>Detener cámara</button>
+
+      <!-- Selector de cámara para evitar "Iriun Webcam" y similares -->
+      <select id="cameraSelect" title="Selecciona cámara">
+        <option value="">Selecciona cámara…</option>
+      </select>
+
+      <!-- Subida de imagen -->
+      <form id="uploadForm" class="row" method="POST" action="/upload" enctype="multipart/form-data">
+        <input class="file" type="file" name="file" id="fileInput" accept="image/*" />
+        <button type="submit">Subir imagen</button>
+      </form>
+
+      <span class="pill" id="status">Estado: listo</span>
+    </div>
+
+    <!-- Video y canvas (canvas oculto para procesar frames) -->
+    <div style="margin-top:12px;">
+      <video id="video" playsinline></video>
+      <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+
+    <!-- Resultados no-url -->
+    <div id="resultBox" style="display:none; margin-top:12px;">
+      <div class="result" id="resultText"></div>
+    </div>
+
+    <div class="footer">
+      Consejo: en móvil, usa el navegador con permisos de cámara. En <em>localhost</em> la cámara funciona sin HTTPS.
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const statusEl = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const resultBox = document.getElementById("resultBox");
+    const resultText = document.getElementById("resultText");
+    const uploadForm = document.getElementById("uploadForm");
+    const cameraSelect = document.getElementById("cameraSelect");
+
+    let stream = null;
+    let scanning = false;
+    let animId = 0;
+    let currentDeviceId = null;
+
+    function setStatus(msg) { statusEl.textContent = "Estado: " + msg; }
+    function isLikelyUrl(text) { return /^(https?:\/\/|www\.)/i.test(text); }
+
+    async function listCameras() {
+      // Pedimos permiso para poder leer labels
+      try {
+        const temp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        temp.getTracks().forEach(t => t.stop());
+      } catch (e) { /* si niega permiso, seguimos con lo que haya */ }
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videos = devices.filter(d => d.kind === "videoinput");
+
+      cameraSelect.innerHTML = '<option value="">Selecciona cámara…</option>';
+
+      // Prioriza cámaras "traseras/externas"
+      videos.sort((a, b) => {
+        const ae = /back|rear|environment/i.test(a.label);
+        const be = /back|rear|environment/i.test(b.label);
+        return (be - ae);
+      });
+
+      for (const d of videos) {
+        const opt = document.createElement("option");
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Cámara ${cameraSelect.length}`;
+        cameraSelect.appendChild(opt);
+      }
+
+      if (videos.length) {
+        const env = videos.find(d => /back|rear|environment/i.test(d.label));
+        currentDeviceId = env ? env.deviceId : videos[0].deviceId;
+        cameraSelect.value = currentDeviceId;
+      }
+    }
+
+    cameraSelect.addEventListener("change", () => {
+      currentDeviceId = cameraSelect.value || null;
+      if (stream) {
+        stopCamera();
+        startCamera();
+      }
+    });
+
+    async function startCamera() {
+      try {
+        const constraints = currentDeviceId
+          ? { video: { deviceId: { exact: currentDeviceId } }, audio: false }
+          : { video: { facingMode: { ideal: "environment" } }, audio: false };
+
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await video.play();
+        scanning = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        setStatus("cámara activa");
+        scanLoop();
+      } catch (err) {
+        console.error(err);
+        setStatus("error al acceder a la cámara");
+      }
+    }
+
+    function stopCamera() {
+      scanning = false;
+      cancelAnimationFrame(animId);
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      setStatus("cámara detenida");
+    }
+
+    async function scanLoop() {
+      if (!scanning) return;
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (w && h) {
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(video, 0, 0, w, h);
+        const imageData = ctx.getImageData(0, 0, w, h);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: "attemptBoth"
+        });
+        if (code && code.data) {
+          const text = code.data.trim();
+          scanning = false;
+          stopCamera();
+
+          if (isLikelyUrl(text)) {
+            const url = text.startsWith("www.") ? "https://" + text : text;
+            setStatus("QR detectado (URL), redirigiendo…");
+            window.location.href = url;
+            return;
+          } else {
+            setStatus("QR detectado (texto)");
+            resultBox.style.display = "block";
+            resultText.textContent = text;
+            return;
+          }
+        }
+      }
+      animId = requestAnimationFrame(scanLoop);
+    }
+
+    // Subida de imagen: el servidor SIEMPRE devuelve JSON
+    uploadForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setStatus("procesando imagen…");
+      const formData = new FormData(uploadForm);
+      try {
+        const res = await fetch("/upload", { method: "POST", body: formData });
+
+        const ctype = res.headers.get("content-type") || "";
+        if (!ctype.includes("application/json")) {
+          const txt = await res.text();
+          console.error("Respuesta no-JSON del servidor:", txt);
+          setStatus("el servidor no devolvió JSON (revisa consola y logs)");
+          return;
+        }
+
+        const data = await res.json();
+
+        if (data.ok === false) {
+          setStatus(data.error || "error leyendo la imagen");
+          return;
+        }
+        if (data.redirect_url) {
+          setStatus("QR detectado (URL), redirigiendo…");
+          window.location.href = data.redirect_url;
+          return;
+        }
+        if (data.qr_data && data.qr_data.length) {
+          setStatus("QR(s) leído(s) de imagen");
+          resultBox.style.display = "block";
+          resultText.textContent = data.qr_data.join("\n");
+          return;
+        }
+        setStatus(data.message || "Sin QR en la imagen");
+      } catch (err) {
+        console.error(err);
+        setStatus("error subiendo/leyendo la imagen");
+      }
+    });
+
+    // Preparar selector al cargar
+    (async () => {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setStatus("tu navegador no soporta cámara");
+        return;
+      }
+      await listCameras();
+    })();
+
+    startBtn.addEventListener("click", startCamera);
+    stopBtn.addEventListener("click", stopCamera);
+  </script>
+</body>
+</html>
+
+
